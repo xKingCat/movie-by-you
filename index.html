@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Choicer Voicer | AI Movie Dubbing</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <h1>CHOICER <span>VOICER</span></h1>
+            <p>The Automatic Dialogue Replacement Game</p>
+        </header>
+
+        <main>
+            <div class="theater-section">
+                <div class="video-container" id="video-container">
+                    <video id="main-video" playsinline></video>
+
+                    <!-- Overlays -->
+                    <div id="overlay-ui" class="overlay hidden">
+                        <h2 id="overlay-text">YOUR TURN</h2>
+                        <div id="countdown" class="countdown">3</div>
+                        <div id="recording-indicator" class="hidden">
+                            <span class="red-dot"></span> RECORDING
+                        </div>
+                    </div>
+                </div>
+
+                <div class="dialogue-panel" id="dialogue-panel">
+                    <div class="dialogue-header">🎬 SCENE LINE</div>
+                    <blockquote id="line-text">Upload or load a scene, then analyze dialogue.</blockquote>
+                    <div class="word-strip" id="word-strip"></div>
+                    <div class="line-timing" id="line-timing">Timing: --:--.--- - --:--.---</div>
+                    <div class="speech-progress"><div id="speech-progress-bar"></div></div>
+                    <div class="recording-status" id="recording-status">🎤 YOUR RECORDING: Waiting for a scene.</div>
+                </div>
+
+                <div class="controls">
+                    <input type="file" id="video-upload" accept="video/mp4, video/webm" class="hidden">
+                    <button id="btn-upload" class="btn primary">Upload Scene</button>
+                    <button id="btn-demo" class="btn secondary">Load Demo Scene</button>
+                    <button id="btn-analyze" class="btn action hidden">Analyze Dialogue</button>
+                    <button id="btn-play-dub" class="btn success hidden">Play Final Mix</button>
+                    <button id="btn-download-mix" class="btn success hidden">Download Dubbed Scene Audio</button>
+                </div>
+            </div>
+
+            <div class="analysis-section">
+                <div class="panel">
+                    <h3>Waveform Match</h3>
+                    <canvas id="waveform-canvas" width="600" height="150"></canvas>
+                </div>
+
+                <div class="panel score-panel">
+                    <h3>Performance Score</h3>
+                    <div class="scores">
+                        <div class="score-item"><span>Match</span> <strong id="score-total">--</strong></div>
+                        <div class="score-item"><span>Timing</span> <strong id="score-timing">--</strong></div>
+                        <div class="score-item"><span>Energy</span> <strong id="score-energy">--</strong></div>
+                        <div class="score-item"><span>Pitch</span> <strong id="score-pitch">--</strong></div>
+                    </div>
+                    <div id="award-display" class="award hidden">🏆 Perfect Timing!</div>
+                </div>
+
+                <div class="panel recordings-panel">
+                    <h3>Your Voice Takes</h3>
+                    <div id="recordings-list" class="recordings-list empty">No recordings yet.</div>
+                </div>
+
+                <div class="panel effects-panel">
+                    <h3>Voice Effects</h3>
+                    <select id="voice-effect">
+                        <option value="none">Normal Voice</option>
+                        <option value="deep">Deep Voice</option>
+                        <option value="high">Cartoon / High</option>
+                        <option value="robot">Robot</option>
+                        <option value="echo">Echo</option>
+                        <option value="radio">Radio</option>
+                    </select>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Scripts loaded synchronously to ensure global availability -->
+    <script src="storage.js"></script>
+    <script src="audio-engine.js"></script>
+    <script src="voice-detector.js"></script>
+    <script src="transcript-manager.js"></script>
+    <script src="recorder.js"></script>
+    <script src="scorer.js"></script>
+    <script src="mixer.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
