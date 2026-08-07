@@ -3,13 +3,27 @@ class VoiceDetector {
         this.segments = [];
         this.options = {
             chunkMs: 50,
-            minSpeechSeconds: 0.35,
-            mergeGapSeconds: 0.45,
+            minSpeechSeconds: 0.3,
+            // How long a quiet stretch has to last before we decide a line is
+            // actually over. Natural speech is full of tiny gaps (breaths,
+            // stops between words) - if this is too short, a single sentence
+            // gets sliced into several segments and each fragment plays back
+            // as if it were "cut off".
+            mergeGapSeconds: 0.6,
+            silenceHoldSeconds: 0.35,
             prePaddingSeconds: 0.5,
-            postPaddingSeconds: 0.8,
+            // Trailing padding is intentionally generous: trimming this too
+            // tight is exactly what makes the last word of a line disappear.
+            postPaddingSeconds: 1.0,
             speechLowHz: 85,
             speechHighHz: 3400,
-            minSpeechBandRatio: 0.22
+            minSpeechBandRatio: 0.16,
+            // Frames are smoothed with a short moving average before
+            // thresholding so a single quiet syllable in the middle of a
+            // word doesn't get treated as silence.
+            smoothingFrames: 3,
+            fftBins: 24,
+            fftWindow: 1024
         };
     }
 
@@ -18,6 +32,16 @@ class VoiceDetector {
         const data = audioBuffer.getChannelData(0);
         const sampleRate = audioBuffer.sampleRate;
         const stepSize = Math.max(1, Math.floor(sampleRate * (this.options.chunkMs / 1000)));
+
+        // Precompute the DFT twiddle factors once per analysis instead of
+        // once per frame. The previous implementation rebuilt every sin/cos
+        // value for every bin on every single frame, which for a full-length
+        // movie clip meant tens of millions of trig calls - slow enough that
+        // "Analyze Dialogue" could look hung or silently give up on longer
+        // videos. The math per frame is identical (same window size, same
+        // bin frequencies), so the trig tables only need to be built once.
+        this.buildTrigTables(sampleRate);
+
         const frames = this.buildAnalysisFrames(data, sampleRate, stepSize);
 
         if (!frames.length || frames.every(frame => frame.rms === 0)) {
@@ -26,19 +50,24 @@ class VoiceDetector {
             return this.segments;
         }
 
-        const rmsValues = frames.map(frame => frame.rms).sort((a, b) => a - b);
+        this.smoothFrames(frames);
+
+        const rmsValues = frames.map(frame => frame.smoothedRms).sort((a, b) => a - b);
         const noiseFloor = rmsValues[Math.floor(rmsValues.length * 0.25)] || 0;
-        const avgEnergy = frames.reduce((sum, frame) => sum + frame.rms, 0) / frames.length;
-        const threshold = Math.max(noiseFloor * 2.8, avgEnergy * 1.2, 0.01);
+        const avgEnergy = frames.reduce((sum, frame) => sum + frame.smoothedRms, 0) / frames.length;
+        // Slightly less aggressive than before (2.8x / 1.2x) so soft
+        // consonants and trailing-off words at the edges of a line stay
+        // above threshold instead of getting trimmed away.
+        const threshold = Math.max(noiseFloor * 2.2, avgEnergy * 0.9, 0.008);
 
         const rawSegments = [];
         let inSpeech = false;
         let startFrame = 0;
         let trailingQuietFrames = 0;
-        const quietFrameAllowance = Math.ceil(0.18 / (this.options.chunkMs / 1000));
+        const quietFrameAllowance = Math.max(1, Math.ceil(this.options.silenceHoldSeconds / (this.options.chunkMs / 1000)));
 
         frames.forEach((frame, index) => {
-            const active = frame.rms >= threshold && frame.speechBandRatio >= this.options.minSpeechBandRatio;
+            const active = frame.smoothedRms >= threshold && frame.speechBandRatio >= this.options.minSpeechBandRatio;
 
             if (active && !inSpeech) {
                 inSpeech = true;
@@ -77,6 +106,29 @@ class VoiceDetector {
         return this.segments;
     }
 
+    buildTrigTables(sampleRate) {
+        const { fftBins, fftWindow } = this.options;
+        const nyquist = sampleRate / 2;
+        this.trigSampleRate = sampleRate;
+        this.binFrequencies = new Array(fftBins);
+        this.cosTable = new Array(fftBins);
+        this.sinTable = new Array(fftBins);
+
+        for (let bin = 1; bin <= fftBins; bin++) {
+            const frequency = (bin / fftBins) * Math.min(5000, nyquist);
+            const cosRow = new Float32Array(fftWindow);
+            const sinRow = new Float32Array(fftWindow);
+            for (let n = 0; n < fftWindow; n++) {
+                const angle = (2 * Math.PI * frequency * n) / sampleRate;
+                cosRow[n] = Math.cos(angle);
+                sinRow[n] = Math.sin(angle);
+            }
+            this.binFrequencies[bin - 1] = frequency;
+            this.cosTable[bin - 1] = cosRow;
+            this.sinTable[bin - 1] = sinRow;
+        }
+    }
+
     buildAnalysisFrames(data, sampleRate, stepSize) {
         const frames = [];
         for (let i = 0; i < data.length; i += stepSize) {
@@ -93,39 +145,56 @@ class VoiceDetector {
                 start: i / sampleRate,
                 end: end / sampleRate,
                 rms,
-                speechBandRatio: this.estimateSpeechBandRatio(data, sampleRate, i, end)
+                smoothedRms: rms,
+                speechBandRatio: this.estimateSpeechBandRatio(data, i, end)
             });
         }
         return frames;
     }
 
-    estimateSpeechBandRatio(data, sampleRate, start, end) {
-        const windowSize = Math.min(1024, end - start);
+    smoothFrames(frames) {
+        const window = Math.max(1, this.options.smoothingFrames);
+        if (window <= 1) return;
+        const half = Math.floor(window / 2);
+        const raw = frames.map(f => f.rms);
+        for (let i = 0; i < frames.length; i++) {
+            let sum = 0;
+            let count = 0;
+            for (let j = Math.max(0, i - half); j <= Math.min(frames.length - 1, i + half); j++) {
+                sum += raw[j];
+                count++;
+            }
+            frames[i].smoothedRms = count ? sum / count : raw[i];
+        }
+    }
+
+    estimateSpeechBandRatio(data, start, end) {
+        const { fftBins, fftWindow, speechLowHz, speechHighHz } = this.options;
+        const windowSize = Math.min(fftWindow, end - start);
         if (windowSize < 32) return 0;
 
         let speechMagnitude = 0;
         let broadMagnitude = 0;
-        const binCount = 32;
-        const nyquist = sampleRate / 2;
 
-        // Lightweight FFT-style frequency sampling. A full FFT library would be
-        // overkill here, so this computes selected DFT bins and compares speech
-        // band energy against broader audible energy.
-        for (let bin = 1; bin <= binCount; bin++) {
-            const frequency = (bin / binCount) * Math.min(5000, nyquist);
+        // Uses the trig tables built once per analysis in buildTrigTables()
+        // instead of recomputing cos/sin per sample here - this is the hot
+        // loop that previously dominated analysis time.
+        for (let bin = 0; bin < fftBins; bin++) {
+            const frequency = this.binFrequencies[bin];
+            const cosRow = this.cosTable[bin];
+            const sinRow = this.sinTable[bin];
             let real = 0;
             let imaginary = 0;
 
             for (let n = 0; n < windowSize; n++) {
                 const sample = data[start + n] || 0;
-                const angle = (2 * Math.PI * frequency * n) / sampleRate;
-                real += sample * Math.cos(angle);
-                imaginary -= sample * Math.sin(angle);
+                real += sample * cosRow[n];
+                imaginary -= sample * sinRow[n];
             }
 
             const magnitude = Math.sqrt((real * real) + (imaginary * imaginary));
             if (frequency >= 60 && frequency <= 5000) broadMagnitude += magnitude;
-            if (frequency >= this.options.speechLowHz && frequency <= this.options.speechHighHz) {
+            if (frequency >= speechLowHz && frequency <= speechHighHz) {
                 speechMagnitude += magnitude;
             }
         }

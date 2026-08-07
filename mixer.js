@@ -52,48 +52,87 @@ class AudioMixer {
         const duration = origBuffer.duration;
         const offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(2, 44100 * duration, 44100);
 
-        // 1. Setup Original track with ducking
+        // --- Pass 1: decode every user take up front and work out its real
+        // timing. A single corrupt/undecodable blob used to throw out of the
+        // whole mix() call, which silently dropped EVERY recorded voice from
+        // the final render, not just the bad one. Now a failure here just
+        // skips that one line (the original dialogue plays through for it)
+        // and mixing continues normally for the rest.
+        const takes = [];
+        for (let i = 0; i < segments.length; i++) {
+            const blob = userBlobs[i];
+            if (!blob) continue;
+
+            const segmentDuration = segments[i].end - segments[i].start;
+            if (segmentDuration <= 0) continue;
+
+            try {
+                const arrayBuffer = await blob.arrayBuffer();
+                const userBuffer = await offlineCtx.decodeAudioData(arrayBuffer);
+
+                // Recording is allowed to run a little past the original
+                // line's timing so a slower take doesn't get chopped off.
+                // Rather than always time-stretching to force an exact fit
+                // (which pitch-shifts the voice on almost every line), only
+                // speed up - and only as much as needed, clamped - when the
+                // take would otherwise run into the next line.
+                const nextStart = segments[i + 1] ? segments[i + 1].start : duration;
+                const room = Math.max(segmentDuration, nextStart - segments[i].start);
+
+                let playbackRate = 1;
+                if (userBuffer.duration > room) {
+                    playbackRate = Math.min(1.15, userBuffer.duration / room);
+                }
+
+                const playedDuration = userBuffer.duration / playbackRate;
+                const stopTime = Math.min(duration, nextStart, segments[i].start + playedDuration);
+
+                takes.push({
+                    index: i,
+                    buffer: userBuffer,
+                    playbackRate,
+                    startTime: segments[i].start,
+                    stopTime: Math.max(segments[i].start, stopTime),
+                    duckUntil: Math.max(segments[i].end, stopTime)
+                });
+            } catch (err) {
+                console.warn(`Could not decode recording for line ${i + 1}, keeping the original dialogue there:`, err);
+            }
+        }
+
+        // --- Pass 2: original track with ducking, held down through
+        // however long each take actually runs (not just the original
+        // line's timing), so a longer take doesn't get talked over by the
+        // original dialogue coming back up early.
         const origSource = offlineCtx.createBufferSource();
         origSource.buffer = origBuffer;
 
         const duckingGain = offlineCtx.createGain();
         duckingGain.gain.setValueAtTime(1, 0);
 
-        // Apply ducking automation during segments
-        segments.forEach(seg => {
-            duckingGain.gain.setTargetAtTime(0.1, seg.start, 0.1); // Drop volume
-            duckingGain.gain.setTargetAtTime(1, seg.end, 0.1);     // Restore volume
+        const takeByIndex = new Map(takes.map(take => [take.index, take]));
+        segments.forEach((seg, i) => {
+            const take = takeByIndex.get(i);
+            duckingGain.gain.setTargetAtTime(0.08, seg.start, 0.1);
+            duckingGain.gain.setTargetAtTime(1, take ? take.duckUntil : seg.end, 0.1);
         });
 
         origSource.connect(duckingGain);
         duckingGain.connect(offlineCtx.destination);
         origSource.start(0);
 
-        // 2. Overlay User tracks
-        for (let i = 0; i < segments.length; i++) {
-            const blob = userBlobs[i];
-            if (!blob) continue;
-
-            const arrayBuffer = await blob.arrayBuffer();
-            const userBuffer = await offlineCtx.decodeAudioData(arrayBuffer);
-
+        // --- Pass 3: schedule the user takes.
+        takes.forEach(take => {
             const userSource = offlineCtx.createBufferSource();
-            userSource.buffer = userBuffer;
+            userSource.buffer = take.buffer;
+            userSource.playbackRate.value = take.playbackRate;
 
-            const segmentDuration = segments[i].end - segments[i].start;
-            if (segmentDuration <= 0) continue;
-            userSource.playbackRate.value = userBuffer.duration / segmentDuration;
-
-            // Apply specific node effects
-            let connectionNode = this.applyEffect(offlineCtx, userSource, effectType);
-
+            const connectionNode = this.applyEffect(offlineCtx, userSource, effectType);
             connectionNode.connect(offlineCtx.destination);
 
-            // Align the user's take to the original dialogue slot and stop it
-            // at the segment boundary to prevent overlap with the next line.
-            userSource.start(segments[i].start);
-            userSource.stop(segments[i].end);
-        }
+            userSource.start(take.startTime);
+            userSource.stop(take.stopTime);
+        });
 
         // Render final mix
         const renderedBuffer = await offlineCtx.startRendering();

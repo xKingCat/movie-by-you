@@ -15,6 +15,11 @@
 
         <main>
             <div class="theater-section">
+                <div class="headphone-tip hidden" id="headphone-tip">
+                    <span>🎧 Tip: use headphones while recording. The original line plays back quietly as a guide — headphones keep it from bleeding into your mic.</span>
+                    <button id="headphone-tip-dismiss" type="button" aria-label="Dismiss tip">✕</button>
+                </div>
+
                 <div class="video-container" id="video-container">
                     <video id="main-video" playsinline></video>
 
@@ -28,11 +33,23 @@
                     </div>
                 </div>
 
+                <div class="line-waveform-panel" id="line-waveform-panel">
+                    <div class="line-waveform-header">
+                        <span>🎙️ Line Waveform</span>
+                        <span class="line-waveform-legend">
+                            <span class="legend-dot orig"></span>Original
+                            <span class="legend-dot user"></span>Your Voice
+                        </span>
+                    </div>
+                    <canvas id="line-waveform-canvas"></canvas>
+                </div>
+
                 <div class="dialogue-panel" id="dialogue-panel">
-                    <div class="dialogue-header">🎬 SCENE LINE</div>
-                    <blockquote id="line-text">Upload or load a scene, then analyze dialogue.</blockquote>
+                    <div class="dialogue-header">🎬 SCENE LINE <span class="edit-hint">(tap text to fix it)</span></div>
+                    <blockquote id="line-text" contenteditable="true" spellcheck="false">Upload or load a scene, then analyze dialogue.</blockquote>
                     <div class="word-strip" id="word-strip"></div>
                     <div class="line-timing" id="line-timing">Timing: --:--.--- - --:--.---</div>
+                    <div class="transcription-warning hidden" id="transcription-warning"></div>
                     <div class="speech-progress"><div id="speech-progress-bar"></div></div>
                     <div class="recording-status" id="recording-status">🎤 YOUR RECORDING: Waiting for a scene.</div>
                 </div>
@@ -44,6 +61,38 @@
                     <button id="btn-analyze" class="btn action hidden">Analyze Dialogue</button>
                     <button id="btn-play-dub" class="btn success hidden">Play Final Mix</button>
                     <button id="btn-download-mix" class="btn success hidden">Download Dubbed Scene Audio</button>
+                </div>
+
+                <div class="transcribe-status hidden" id="transcribe-status"></div>
+
+                <label class="advanced-toggle">
+                    <input type="checkbox" id="advanced-cuts-toggle">
+                    Advanced: let me edit the cuts before recording
+                </label>
+            </div>
+
+            <div class="cut-editor hidden" id="cut-editor">
+                <div class="cut-editor-header">
+                    <h3>Edit Cuts</h3>
+                    <p>Drag a block's edges to resize it, drag its middle to move it. Click empty space to move the playhead.</p>
+                </div>
+                <div class="cut-editor-toolbar">
+                    <button id="cut-preview" class="btn secondary small" type="button">▶ Preview Line</button>
+                    <button id="cut-split" class="btn secondary small" type="button">✂ Split at Playhead</button>
+                    <button id="cut-merge-next" class="btn secondary small" type="button">⇥ Merge with Next</button>
+                    <button id="cut-add" class="btn secondary small" type="button">+ Add Line</button>
+                    <button id="cut-delete" class="btn secondary small" type="button">🗑 Delete Line</button>
+                </div>
+                <div class="cut-timeline-scroll" id="cut-timeline-scroll">
+                    <div class="cut-timeline" id="cut-timeline">
+                        <canvas id="cut-waveform"></canvas>
+                        <div class="cut-blocks" id="cut-blocks"></div>
+                        <div class="cut-playhead" id="cut-playhead"></div>
+                    </div>
+                </div>
+                <div class="cut-editor-actions">
+                    <span id="cut-editor-hint">No line selected.</span>
+                    <button id="btn-confirm-cuts" class="btn success">Confirm Cuts &amp; Start Recording</button>
                 </div>
             </div>
 
@@ -88,8 +137,10 @@
     <script src="storage.js"></script>
     <script src="audio-engine.js"></script>
     <script src="voice-detector.js"></script>
-    <script src="transcript-manager.js"></script>
+    <script src="scene-transcriber.js"></script>
+    <script src="cut-editor.js"></script>
     <script src="recorder.js"></script>
+    <script src="line-waveform.js"></script>
     <script src="scorer.js"></script>
     <script src="mixer.js"></script>
     <script src="app.js"></script>
