@@ -3,7 +3,9 @@ class VoiceDetector {
         this.segments = [];
         this.options = {
             chunkMs: 50,
-            minSpeechSeconds: 0.3,
+            // Short interjections ("No!", "Wait.") are real lines too - a
+            // 0.3s floor was silently dropping them entirely.
+            minSpeechSeconds: 0.18,
             // How long a quiet stretch has to last before we decide a line is
             // actually over. Natural speech is full of tiny gaps (breaths,
             // stops between words) - if this is too short, a single sentence
@@ -17,13 +19,39 @@ class VoiceDetector {
             postPaddingSeconds: 1.0,
             speechLowHz: 85,
             speechHighHz: 3400,
-            minSpeechBandRatio: 0.16,
+            minSpeechBandRatio: 0.12,
+            // A frame whose energy is clearly, unambiguously above its local
+            // threshold is trusted as speech even if the spectral band-ratio
+            // heuristic doesn't love its timbre (deep voices, sibilants,
+            // clipping, etc). The band-ratio check only gets to veto frames
+            // that are merely borderline-loud, where it's actually useful
+            // for telling a quiet word apart from a quiet hum or rumble.
+            strongEnergyMultiplier: 1.8,
             // Frames are smoothed with a short moving average before
             // thresholding so a single quiet syllable in the middle of a
             // word doesn't get treated as silence.
             smoothingFrames: 3,
             fftBins: 24,
-            fftWindow: 1024
+            fftWindow: 1024,
+            // Instead of one energy threshold for the whole clip - which a
+            // single loud section (music, action, a shout) drags high
+            // enough to bury every quieter line elsewhere in the same
+            // scene - the threshold is recomputed from a local window
+            // around each frame, so a hushed line in an otherwise quiet
+            // stretch and a hushed line right after a loud stretch are both
+            // judged against their own surroundings.
+            localWindowSeconds: 5,
+            localNoisePercentile: 0.15,
+            localThresholdMultiplier: 1.6,
+            localThresholdRecomputeSeconds: 0.5,
+            absoluteFloor: 0.004,
+            // Safety net for the local-threshold approach: if a loud
+            // passage runs long enough with little enough amplitude
+            // variance, its own local "noise floor" can sit too close to
+            // its own loud level and start suppressing itself. Any frame
+            // clearly above the whole clip's own typical loudness is
+            // treated as active no matter what the local threshold says.
+            globalBypassPercentile: 0.6
         };
     }
 
@@ -51,23 +79,22 @@ class VoiceDetector {
         }
 
         this.smoothFrames(frames);
-
-        const rmsValues = frames.map(frame => frame.smoothedRms).sort((a, b) => a - b);
-        const noiseFloor = rmsValues[Math.floor(rmsValues.length * 0.25)] || 0;
-        const avgEnergy = frames.reduce((sum, frame) => sum + frame.smoothedRms, 0) / frames.length;
-        // Slightly less aggressive than before (2.8x / 1.2x) so soft
-        // consonants and trailing-off words at the edges of a line stay
-        // above threshold instead of getting trimmed away.
-        const threshold = Math.max(noiseFloor * 2.2, avgEnergy * 0.9, 0.008);
+        const thresholds = this.computeLocalThresholds(frames);
+        const globalBypassFloor = this.computeGlobalBypassFloor(frames);
 
         const rawSegments = [];
         let inSpeech = false;
         let startFrame = 0;
         let trailingQuietFrames = 0;
+        let droppedShortSpans = 0;
         const quietFrameAllowance = Math.max(1, Math.ceil(this.options.silenceHoldSeconds / (this.options.chunkMs / 1000)));
 
         frames.forEach((frame, index) => {
-            const active = frame.smoothedRms >= threshold && frame.speechBandRatio >= this.options.minSpeechBandRatio;
+            const localThreshold = thresholds[index];
+            const strongEnergy = frame.smoothedRms >= localThreshold * this.options.strongEnergyMultiplier;
+            const passesLocal = frame.smoothedRms >= localThreshold &&
+                (strongEnergy || frame.speechBandRatio >= this.options.minSpeechBandRatio);
+            const active = passesLocal || frame.smoothedRms >= globalBypassFloor;
 
             if (active && !inSpeech) {
                 inSpeech = true;
@@ -76,7 +103,9 @@ class VoiceDetector {
             } else if (!active && inSpeech) {
                 trailingQuietFrames++;
                 if (trailingQuietFrames >= quietFrameAllowance) {
-                    this.pushSpeechSegment(rawSegments, audioBuffer, frames, startFrame, index - trailingQuietFrames + 1);
+                    if (!this.pushSpeechSegment(rawSegments, audioBuffer, frames, startFrame, index - trailingQuietFrames + 1)) {
+                        droppedShortSpans++;
+                    }
                     inSpeech = false;
                     trailingQuietFrames = 0;
                 }
@@ -86,7 +115,9 @@ class VoiceDetector {
         });
 
         if (inSpeech) {
-            this.pushSpeechSegment(rawSegments, audioBuffer, frames, startFrame, frames.length - 1);
+            if (!this.pushSpeechSegment(rawSegments, audioBuffer, frames, startFrame, frames.length - 1)) {
+                droppedShortSpans++;
+            }
         }
 
         this.segments = this.mergeSegments(rawSegments).map((segment, index) => ({
@@ -98,12 +129,45 @@ class VoiceDetector {
             words: segment.words || []
         }));
 
+        if (droppedShortSpans > 0) {
+            console.log(`Skipped ${droppedShortSpans} sound(s) shorter than ${this.options.minSpeechSeconds}s (likely noise, not dropped dialogue).`);
+        }
         if (this.segments.length === 0) {
             console.warn('No dialogue detected. Try a file with clearer speech or less background music.');
         }
 
         console.log('Detected Dialogue Segments:', this.segments);
         return this.segments;
+    }
+
+    /** Recomputes a local noise floor every ~0.5s from a several-second
+     *  window around it (20th percentile RMS, which is robust to a couple
+     *  of loud transients inside the window) rather than using one number
+     *  for the whole clip. Strided rather than per-frame since the noise
+     *  floor doesn't meaningfully change faster than this. */
+    computeLocalThresholds(frames) {
+        const { chunkMs, localWindowSeconds, localNoisePercentile, localThresholdMultiplier, localThresholdRecomputeSeconds, absoluteFloor } = this.options;
+        const framesPerSecond = 1 / (chunkMs / 1000);
+        const windowFrames = Math.max(10, Math.round(localWindowSeconds * framesPerSecond));
+        const half = Math.floor(windowFrames / 2);
+        const stride = Math.max(1, Math.round(localThresholdRecomputeSeconds * framesPerSecond));
+
+        const rms = frames.map(f => f.smoothedRms);
+        const thresholds = new Array(frames.length);
+        let lastValue = absoluteFloor;
+
+        for (let i = 0; i < frames.length; i += stride) {
+            const lo = Math.max(0, i - half);
+            const hi = Math.min(frames.length - 1, i + half);
+            const windowVals = rms.slice(lo, hi + 1).sort((a, b) => a - b);
+            const noiseFloor = windowVals[Math.floor(windowVals.length * localNoisePercentile)] || 0;
+            lastValue = Math.max(noiseFloor * localThresholdMultiplier, absoluteFloor);
+
+            for (let j = i; j < Math.min(frames.length, i + stride); j++) {
+                thresholds[j] = lastValue;
+            }
+        }
+        return thresholds;
     }
 
     buildTrigTables(sampleRate) {
@@ -205,11 +269,22 @@ class VoiceDetector {
     pushSpeechSegment(segments, audioBuffer, frames, startFrame, endFrame) {
         const speechStart = frames[startFrame].start;
         const speechEnd = frames[Math.max(startFrame, endFrame)].end;
-        if (speechEnd - speechStart < this.options.minSpeechSeconds) return;
+        if (speechEnd - speechStart < this.options.minSpeechSeconds) return false;
 
         const start = Math.max(0, speechStart - this.options.prePaddingSeconds);
         const end = Math.min(audioBuffer.duration, speechEnd + this.options.postPaddingSeconds);
         segments.push({ start, end, speechStart, speechEnd });
+        return true;
+    }
+
+    /** A robust (percentile-based) global loudness reference for the whole
+     *  clip, used purely as a safety-net bypass so a sustained, low-variance
+     *  loud passage can never fully suppress itself under the local
+     *  adaptive threshold above. */
+    computeGlobalBypassFloor(frames) {
+        const sorted = frames.map(f => f.smoothedRms).sort((a, b) => a - b);
+        const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * this.options.globalBypassPercentile));
+        return Math.max(sorted[idx] || 0, this.options.absoluteFloor);
     }
 
     mergeSegments(segments) {
